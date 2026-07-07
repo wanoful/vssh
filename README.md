@@ -1,0 +1,80 @@
+# vssh
+
+`vssh` is an SSH wrapper that lets a remote shell command like `code .` open your
+local VS Code through Remote-SSH.
+
+The remote `code` command is a small shim. It sends an authenticated request over
+an SSH reverse tunnel to a local bridge. The local bridge runs the real VS Code
+CLI:
+
+```sh
+code --remote ssh-remote+<host> <remote-path>
+```
+
+## Build
+
+```sh
+cargo build --release
+```
+
+## Install the remote shim
+
+Install `~/.local/bin/code` on the remote host:
+
+```sh
+vssh install-shim myhost
+```
+
+Make sure `~/.local/bin` is before any real `code` binary in the remote `PATH`.
+
+## Connect
+
+Start SSH through `vssh`:
+
+```sh
+vssh myhost
+```
+
+Inside that remote shell:
+
+```sh
+code .
+code file.rs
+code -g src/main.rs:42:1
+code -r .
+```
+
+If the SSH target name is different from the VS Code Remote-SSH host alias, pass
+the VS Code alias explicitly:
+
+```sh
+vssh --code-host devbox-alias user@example.com
+```
+
+Raw SSH options can be passed after `--`:
+
+```sh
+vssh myhost -- -p 2222
+```
+
+## Security Model
+
+`vssh` binds the bridge to `127.0.0.1`, creates a per-session random token, and
+uses SSH reverse forwarding to expose the bridge only to the remote loopback
+address. The bridge does not execute arbitrary remote-provided commands. It only
+translates a small allowlist of VS Code CLI arguments and invokes the configured
+local `code` binary.
+
+Supported remote `code` forms:
+
+- `code`
+- `code .`
+- `code <path>`
+- `code -r|--reuse-window <path>`
+- `code -n|--new-window <path>`
+- `code -g|--goto <file:line[:column]>`
+- `code --diff <left> <right>`
+- `code --add <folder>`
+- `code --wait <path>`
+
+Unknown flags are rejected by the local bridge.
