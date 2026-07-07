@@ -35,6 +35,12 @@ Start SSH through `vssh`:
 vssh myhost
 ```
 
+Suppress the bridge startup line with quiet mode:
+
+```sh
+vssh --quiet myhost
+```
+
 Inside that remote shell:
 
 ```sh

@@ -51,6 +51,7 @@ struct ConnectOptions {
     code_host: String,
     local_port: Option<u16>,
     remote_port: u16,
+    quiet: bool,
     ssh_bin: String,
     code_bin: String,
     ssh_args: Vec<String>,
@@ -96,6 +97,7 @@ fn parse_connect(args: &[String]) -> Result<ConnectOptions> {
     let mut local_port = None;
     let mut remote_port = DEFAULT_REMOTE_PORT;
     let mut code_host = None;
+    let mut quiet = false;
     let mut ssh_bin = env::var("VSSH_SSH").unwrap_or_else(|_| "ssh".to_string());
     let mut code_bin = env::var("VSSH_CODE").unwrap_or_else(|_| "code".to_string());
     let mut host = None;
@@ -128,6 +130,9 @@ fn parse_connect(args: &[String]) -> Result<ConnectOptions> {
                 i += 1;
                 code_bin = parse_value(args.get(i), "--code-bin")?.to_string();
             }
+            "-q" | "--quiet" => {
+                quiet = true;
+            }
             "-h" | "--help" => {
                 bail!("use `vssh --help` for usage");
             }
@@ -153,6 +158,7 @@ fn parse_connect(args: &[String]) -> Result<ConnectOptions> {
         code_host,
         local_port,
         remote_port,
+        quiet,
         ssh_bin,
         code_bin,
         ssh_args,
@@ -234,10 +240,12 @@ async fn connect(opts: ConnectOptions) -> Result<()> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let bridge = tokio::spawn(run_bridge(listener, state, shutdown_rx));
 
-    eprintln!(
-        "vssh: bridge listening on {local_addr}; forwarding remote 127.0.0.1:{}",
-        opts.remote_port
-    );
+    if !opts.quiet {
+        eprintln!(
+            "vssh: bridge listening on {local_addr}; forwarding remote 127.0.0.1:{}",
+            opts.remote_port
+        );
+    }
 
     let status = run_ssh(&opts, local_addr.port(), &token).await;
     let _ = shutdown_tx.send(());
@@ -723,6 +731,7 @@ Connect options:
   --code-host HOST     VS Code Remote-SSH target name. Defaults to <host>.
   --local-port PORT    Local bridge port. Defaults to an ephemeral port.
   --remote-port PORT   Remote loopback port for reverse forwarding. Defaults to 39045.
+  -q, --quiet          Suppress bridge startup logging.
   --ssh-bin PATH       SSH executable. Defaults to $VSSH_SSH or ssh.
   --code-bin PATH      Local VS Code CLI. Defaults to $VSSH_CODE or code.
 
