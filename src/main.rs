@@ -12,6 +12,7 @@ use std::{
     env,
     ffi::OsString,
     net::{SocketAddr, TcpListener as StdTcpListener},
+    path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
 };
@@ -411,7 +412,7 @@ async fn open_handler(
             StatusCode::BAD_REQUEST,
             Json(OpenResponse {
                 ok: false,
-                message: error.to_string(),
+                message: format!("{error:#}"),
                 argv: Vec::new(),
             }),
         )
@@ -442,11 +443,18 @@ async fn handle_open(
     ];
     argv.extend(translated);
 
-    let status = Command::new(&state.code_bin)
+    let code_bin = resolve_local_program(&state.code_bin)?;
+    let status = Command::new(&code_bin)
         .args(&argv)
         .status()
         .await
-        .with_context(|| format!("failed to start local `{}`", state.code_bin))?;
+        .with_context(|| {
+            format!(
+                "failed to start local `{}` resolved as `{}`",
+                state.code_bin,
+                code_bin.display()
+            )
+        })?;
 
     if !status.success() {
         bail!("local `{}` exited with status {status}", state.code_bin);
@@ -471,6 +479,80 @@ fn authorize(headers: &HeaderMap, token: &str) -> Result<()> {
         bail!("invalid Authorization token");
     }
     Ok(())
+}
+
+fn resolve_local_program(program: &str) -> Result<PathBuf> {
+    let path = Path::new(program);
+    if has_path_separator(program) || path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+
+    let candidates = executable_candidates(program);
+    let Some(path_env) = env::var_os("PATH") else {
+        bail!("local `{program}` not found because PATH is not set");
+    };
+
+    for directory in env::split_paths(&path_env) {
+        for candidate in &candidates {
+            let path = directory.join(candidate);
+            if is_executable_file(&path) {
+                return Ok(path);
+            }
+        }
+    }
+
+    bail!(
+        "local `{program}` not found in PATH; set --code-bin or VSSH_CODE to the VS Code CLI path"
+    );
+}
+
+fn has_path_separator(value: &str) -> bool {
+    value.contains('/') || value.contains('\\')
+}
+
+fn executable_candidates(program: &str) -> Vec<OsString> {
+    let path = Path::new(program);
+    if path.extension().is_some() {
+        return vec![OsString::from(program)];
+    }
+
+    #[cfg(windows)]
+    {
+        let mut candidates = vec![OsString::from(program)];
+        let pathext = env::var_os("PATHEXT").unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+        for extension in pathext.to_string_lossy().split(';') {
+            if extension.is_empty() {
+                continue;
+            }
+            candidates.push(OsString::from(format!("{program}{extension}")));
+        }
+        candidates
+    }
+
+    #[cfg(not(windows))]
+    {
+        vec![OsString::from(program)]
+    }
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(metadata) = path.metadata() else {
+            return false;
+        };
+        metadata.permissions().mode() & 0o111 != 0
+    }
+
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -792,5 +874,13 @@ mod tests {
     #[test]
     fn quotes_shell_values() {
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn keeps_explicit_program_extension() {
+        assert_eq!(
+            executable_candidates("code.cmd"),
+            vec![OsString::from("code.cmd")]
+        );
     }
 }

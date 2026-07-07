@@ -57,6 +57,14 @@ Raw SSH options can be passed after `--`:
 vssh myhost -- -p 2222
 ```
 
+On Windows, `vssh` searches `PATH` and `PATHEXT` for the VS Code CLI, so the
+usual `code.cmd` shim is supported. If VS Code is not on `PATH`, pass it
+explicitly:
+
+```powershell
+.\vssh.exe --code-bin "$env:LOCALAPPDATA\Programs\Microsoft VS Code\bin\code.cmd" myhost
+```
+
 ## Security Model
 
 `vssh` binds the bridge to `127.0.0.1`, creates a per-session random token, and
