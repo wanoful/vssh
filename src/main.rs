@@ -18,7 +18,9 @@ use std::{
 };
 use tokio::{net::TcpListener, process::Command, sync::oneshot};
 
-const DEFAULT_REMOTE_PORT: u16 = 39045;
+const RANDOM_REMOTE_PORT_START: u16 = 40000;
+const RANDOM_REMOTE_PORT_END: u16 = 60999;
+const RANDOM_REMOTE_PORT_ATTEMPTS: usize = 10;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -50,7 +52,7 @@ struct ConnectOptions {
     host: String,
     code_host: String,
     local_port: Option<u16>,
-    remote_port: u16,
+    remote_port: Option<u16>,
     quiet: bool,
     ssh_bin: String,
     code_bin: String,
@@ -95,7 +97,7 @@ impl Cli {
 
 fn parse_connect(args: &[String]) -> Result<ConnectOptions> {
     let mut local_port = None;
-    let mut remote_port = DEFAULT_REMOTE_PORT;
+    let mut remote_port = None;
     let mut code_host = None;
     let mut quiet = false;
     let mut ssh_bin = env::var("VSSH_SSH").unwrap_or_else(|_| "ssh".to_string());
@@ -116,7 +118,7 @@ fn parse_connect(args: &[String]) -> Result<ConnectOptions> {
             }
             "--remote-port" => {
                 i += 1;
-                remote_port = parse_port(args.get(i), "--remote-port")?;
+                remote_port = Some(parse_port(args.get(i), "--remote-port")?);
             }
             "--code-host" => {
                 i += 1;
@@ -240,14 +242,7 @@ async fn connect(opts: ConnectOptions) -> Result<()> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     let bridge = tokio::spawn(run_bridge(listener, state, shutdown_rx));
 
-    if !opts.quiet {
-        eprintln!(
-            "vssh: bridge listening on {local_addr}; forwarding remote 127.0.0.1:{}",
-            opts.remote_port
-        );
-    }
-
-    let status = run_ssh(&opts, local_addr.port(), &token).await;
+    let status = run_ssh_with_retries(&opts, local_addr, &token).await;
     let _ = shutdown_tx.send(());
     bridge
         .await
@@ -287,10 +282,11 @@ fn generate_token() -> String {
 async fn run_ssh(
     opts: &ConnectOptions,
     local_port: u16,
+    remote_port: u16,
     token: &str,
 ) -> Result<std::process::ExitStatus> {
-    let forward = format!("127.0.0.1:{}:127.0.0.1:{local_port}", opts.remote_port);
-    let remote_command = remote_shell_command(opts.remote_port, token, &opts.code_host);
+    let forward = format!("127.0.0.1:{remote_port}:127.0.0.1:{local_port}");
+    let remote_command = remote_shell_command(remote_port, token, &opts.code_host);
 
     let mut command = Command::new(&opts.ssh_bin);
     command
@@ -310,6 +306,66 @@ async fn run_ssh(
         .status()
         .await
         .with_context(|| format!("failed to start `{}`", opts.ssh_bin))
+}
+
+async fn run_ssh_with_retries(
+    opts: &ConnectOptions,
+    local_addr: SocketAddr,
+    token: &str,
+) -> Result<std::process::ExitStatus> {
+    if let Some(remote_port) = opts.remote_port {
+        log_bridge(opts, local_addr, remote_port);
+        return run_ssh(opts, local_addr.port(), remote_port, token).await;
+    }
+
+    let mut last_error = None;
+    for attempt in 1..=RANDOM_REMOTE_PORT_ATTEMPTS {
+        let remote_port = random_remote_port();
+        log_bridge(opts, local_addr, remote_port);
+
+        match run_ssh(opts, local_addr.port(), remote_port, token).await {
+            Ok(status) if status.success() => return Ok(status),
+            Ok(status)
+                if is_retryable_ssh_status(status) && attempt < RANDOM_REMOTE_PORT_ATTEMPTS =>
+            {
+                last_error = Some(anyhow!("ssh exited with status {status}"));
+                if !opts.quiet {
+                    eprintln!(
+                        "vssh: ssh exited while using remote port {remote_port}; retrying with another port"
+                    );
+                }
+            }
+            Ok(status) => return Ok(status),
+            Err(error) if attempt < RANDOM_REMOTE_PORT_ATTEMPTS => {
+                last_error = Some(error);
+                if !opts.quiet {
+                    eprintln!(
+                        "vssh: failed to start ssh while using remote port {remote_port}; retrying with another port"
+                    );
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("failed to start ssh")))
+}
+
+fn is_retryable_ssh_status(status: std::process::ExitStatus) -> bool {
+    status.code() == Some(255)
+}
+
+fn random_remote_port() -> u16 {
+    let span = u32::from(RANDOM_REMOTE_PORT_END - RANDOM_REMOTE_PORT_START + 1);
+    RANDOM_REMOTE_PORT_START + (OsRng.next_u32() % span) as u16
+}
+
+fn log_bridge(opts: &ConnectOptions, local_addr: SocketAddr, remote_port: u16) {
+    if !opts.quiet {
+        eprintln!(
+            "vssh: bridge listening on {local_addr}; forwarding remote 127.0.0.1:{remote_port}"
+        );
+    }
 }
 
 fn remote_shell_command(remote_port: u16, token: &str, code_host: &str) -> String {
@@ -743,7 +799,7 @@ Usage:
 Connect options:
   --code-host HOST     VS Code Remote-SSH target name. Defaults to <host>.
   --local-port PORT    Local bridge port. Defaults to an ephemeral port.
-  --remote-port PORT   Remote loopback port for reverse forwarding. Defaults to 39045.
+  --remote-port PORT   Remote loopback port for reverse forwarding. Defaults to a random high port.
   -q, --quiet          Suppress bridge startup logging.
   --ssh-bin PATH       SSH executable. Defaults to $VSSH_SSH or ssh.
   --code-bin PATH      Local VS Code CLI. Defaults to $VSSH_CODE or code.
@@ -904,5 +960,13 @@ mod tests {
             executable_candidates("code.cmd"),
             vec![OsString::from("code.cmd")]
         );
+    }
+
+    #[test]
+    fn random_remote_port_stays_in_range() {
+        for _ in 0..100 {
+            let port = random_remote_port();
+            assert!((RANDOM_REMOTE_PORT_START..=RANDOM_REMOTE_PORT_END).contains(&port));
+        }
     }
 }

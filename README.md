@@ -41,6 +41,14 @@ Suppress the bridge startup line with quiet mode:
 vssh --quiet myhost
 ```
 
+By default, each session chooses a random high remote loopback port so multiple
+`vssh` sessions can connect to the same host at the same time. For debugging or
+special cases, force a specific remote port:
+
+```sh
+vssh --remote-port 39045 myhost
+```
+
 Inside that remote shell:
 
 ```sh
