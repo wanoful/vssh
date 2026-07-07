@@ -492,6 +492,18 @@ fn authorize(headers: &HeaderMap, token: &str) -> Result<()> {
 fn resolve_local_program(program: &str) -> Result<PathBuf> {
     let path = Path::new(program);
     if has_path_separator(program) || path.is_absolute() {
+        #[cfg(windows)]
+        {
+            if path.extension().is_none() {
+                for candidate in executable_candidates(program) {
+                    let candidate = PathBuf::from(candidate);
+                    if is_executable_file(&candidate) {
+                        return Ok(candidate);
+                    }
+                }
+            }
+        }
+
         return Ok(path.to_path_buf());
     }
 
@@ -526,7 +538,7 @@ fn executable_candidates(program: &str) -> Vec<OsString> {
 
     #[cfg(windows)]
     {
-        let mut candidates = vec![OsString::from(program)];
+        let mut candidates = Vec::new();
         let pathext = env::var_os("PATHEXT").unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
         for extension in pathext.to_string_lossy().split(';') {
             if extension.is_empty() {
@@ -534,6 +546,7 @@ fn executable_candidates(program: &str) -> Vec<OsString> {
             }
             candidates.push(OsString::from(format!("{program}{extension}")));
         }
+        candidates.push(OsString::from(program));
         candidates
     }
 
