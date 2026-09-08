@@ -71,6 +71,10 @@ Raw SSH options can be passed after `--`:
 vssh myhost -- -p 2222
 ```
 
+When `-p PORT`, `-pPORT`, or the equivalent `-o Port=PORT` is used, `vssh`
+also includes that port in the VS Code Remote-SSH target. This keeps a remote
+`code .` connection on the same SSH port as the shell opened by `vssh`.
+
 On Windows, `vssh` searches `PATH` and `PATHEXT` for the VS Code CLI, so the
 usual `code.cmd` shim is supported. If VS Code is not on `PATH`, pass it
 explicitly:

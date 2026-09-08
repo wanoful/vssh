@@ -233,9 +233,11 @@ async fn connect(opts: ConnectOptions) -> Result<()> {
         .local_addr()
         .context("failed to read local bridge address")?;
     let token = generate_token();
+    let code_remote_authority = code_remote_authority(&opts.code_host, &opts.ssh_args)?;
     let state = Arc::new(BridgeState {
         token: token.clone(),
         code_host: opts.code_host.clone(),
+        code_remote_authority,
         code_bin: opts.code_bin.clone(),
     });
 
@@ -444,6 +446,7 @@ async fn install_shim(opts: InstallShimOptions) -> Result<()> {
 struct BridgeState {
     token: String,
     code_host: String,
+    code_remote_authority: String,
     code_bin: String,
 }
 
@@ -503,7 +506,7 @@ async fn handle_open(
     let translated = translate_code_args(&request.cwd, &request.args)?;
     let mut argv = vec![
         "--remote".to_string(),
-        format!("ssh-remote+{}", state.code_host),
+        format!("ssh-remote+{}", state.code_remote_authority),
     ];
     argv.extend(translated);
 
@@ -529,6 +532,83 @@ async fn handle_open(
         message: "opened".to_string(),
         argv,
     })
+}
+
+fn code_remote_authority(code_host: &str, ssh_args: &[String]) -> Result<String> {
+    let Some(port) = ssh_port(ssh_args)? else {
+        return Ok(code_host.to_string());
+    };
+
+    let (user, host) = code_host
+        .rsplit_once('@')
+        .map_or((None, code_host), |(user, host)| (Some(user), host));
+    let host = if let Some(bracket_end) = host.strip_prefix('[').and_then(|host| host.find(']')) {
+        &host[..bracket_end + 2]
+    } else if host.matches(':').count() == 1
+        && host
+            .rsplit_once(':')
+            .is_some_and(|(_, port)| port.parse::<u16>().is_ok())
+    {
+        host.rsplit_once(':').expect("port suffix was checked").0
+    } else {
+        host
+    };
+    let host = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+
+    Ok(match user {
+        Some(user) => format!("{user}@{host}:{port}"),
+        None => format!("{host}:{port}"),
+    })
+}
+
+fn ssh_port(args: &[String]) -> Result<Option<u16>> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        let value = if arg == "-p" {
+            i += 1;
+            Some(
+                args.get(i)
+                    .ok_or_else(|| anyhow!("SSH option `-p` requires a port"))?
+                    .as_str(),
+            )
+        } else if let Some(value) = arg.strip_prefix("-p") {
+            Some(value)
+        } else if arg == "-o" {
+            i += 1;
+            args.get(i).and_then(|value| ssh_port_option(value))
+        } else if let Some(option) = arg.strip_prefix("-o") {
+            ssh_port_option(option)
+        } else {
+            None
+        };
+
+        if let Some(value) = value {
+            return value
+                .parse::<u16>()
+                .with_context(|| format!("SSH port `{value}` is not a TCP port number"))
+                .map(Some);
+        }
+        i += 1;
+    }
+
+    Ok(None)
+}
+
+fn ssh_port_option(option: &str) -> Option<&str> {
+    let option = option.trim();
+    let keyword_end = option
+        .find(|ch: char| ch == '=' || ch.is_ascii_whitespace())
+        .unwrap_or(option.len());
+    if !option[..keyword_end].eq_ignore_ascii_case("port") {
+        return None;
+    }
+
+    Some(option[keyword_end..].trim_start_matches(|ch: char| ch == '=' || ch.is_ascii_whitespace()))
 }
 
 fn authorize(headers: &HeaderMap, token: &str) -> Result<()> {
@@ -952,6 +1032,50 @@ mod tests {
     #[test]
     fn quotes_shell_values() {
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn adds_raw_ssh_port_to_code_authority() {
+        assert_eq!(
+            code_remote_authority("dm3", &["-p".to_string(), "11121".to_string()]).unwrap(),
+            "dm3:11121"
+        );
+        assert_eq!(
+            code_remote_authority("user@dm3", &["-p2222".to_string()]).unwrap(),
+            "user@dm3:2222"
+        );
+    }
+
+    #[test]
+    fn recognizes_ssh_port_o_option() {
+        assert_eq!(
+            code_remote_authority("dm3", &["-o".to_string(), "Port=11121".to_string()]).unwrap(),
+            "dm3:11121"
+        );
+        assert_eq!(
+            code_remote_authority("dm3", &["-oport=2222".to_string()]).unwrap(),
+            "dm3:2222"
+        );
+    }
+
+    #[test]
+    fn keeps_code_authority_without_raw_ssh_port() {
+        assert_eq!(
+            code_remote_authority("dm3", &["-i".to_string(), "key".to_string()]).unwrap(),
+            "dm3"
+        );
+    }
+
+    #[test]
+    fn replaces_existing_code_authority_port() {
+        assert_eq!(
+            code_remote_authority("user@dm3:22", &["-p11121".to_string()]).unwrap(),
+            "user@dm3:11121"
+        );
+        assert_eq!(
+            code_remote_authority("2001:db8::1", &["-p11121".to_string()]).unwrap(),
+            "[2001:db8::1]:11121"
+        );
     }
 
     #[test]
