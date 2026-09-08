@@ -273,6 +273,10 @@ fn generate_token() -> String {
     let mut bytes = [0_u8; 32];
     OsRng.fill_bytes(&mut bytes);
 
+    hex_encode(&bytes)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         use std::fmt::Write;
@@ -542,27 +546,35 @@ fn code_remote_authority(code_host: &str, ssh_args: &[String]) -> Result<String>
     let (user, host) = code_host
         .rsplit_once('@')
         .map_or((None, code_host), |(user, host)| (Some(user), host));
-    let host = if let Some(bracket_end) = host.strip_prefix('[').and_then(|host| host.find(']')) {
-        &host[..bracket_end + 2]
-    } else if host.matches(':').count() == 1
-        && host
-            .rsplit_once(':')
-            .is_some_and(|(_, port)| port.parse::<u16>().is_ok())
-    {
-        host.rsplit_once(':').expect("port suffix was checked").0
-    } else {
-        host
-    };
-    let host = if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
-    };
+    let host_name =
+        if let Some(bracket_end) = host.strip_prefix('[').and_then(|host| host.find(']')) {
+            &host[1..bracket_end + 1]
+        } else if host.matches(':').count() == 1
+            && host
+                .rsplit_once(':')
+                .is_some_and(|(_, port)| port.parse::<u16>().is_ok())
+        {
+            host.rsplit_once(':').expect("port suffix was checked").0
+        } else {
+            host
+        };
 
-    Ok(match user {
-        Some(user) => format!("{user}@{host}:{port}"),
-        None => format!("{host}:{port}"),
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Authority<'a> {
+        host_name: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        user: Option<&'a str>,
+        port: u16,
+    }
+
+    let authority = serde_json::to_vec(&Authority {
+        host_name,
+        user,
+        port,
     })
+    .context("failed to encode VS Code Remote-SSH authority")?;
+    Ok(hex_encode(&authority))
 }
 
 fn ssh_port(args: &[String]) -> Result<Option<u16>> {
@@ -1038,11 +1050,11 @@ mod tests {
     fn adds_raw_ssh_port_to_code_authority() {
         assert_eq!(
             code_remote_authority("dm3", &["-p".to_string(), "11121".to_string()]).unwrap(),
-            "dm3:11121"
+            "7b22686f73744e616d65223a22646d33222c22706f7274223a31313132317d"
         );
         assert_eq!(
             code_remote_authority("user@dm3", &["-p2222".to_string()]).unwrap(),
-            "user@dm3:2222"
+            "7b22686f73744e616d65223a22646d33222c2275736572223a2275736572222c22706f7274223a323232327d"
         );
     }
 
@@ -1050,11 +1062,11 @@ mod tests {
     fn recognizes_ssh_port_o_option() {
         assert_eq!(
             code_remote_authority("dm3", &["-o".to_string(), "Port=11121".to_string()]).unwrap(),
-            "dm3:11121"
+            "7b22686f73744e616d65223a22646d33222c22706f7274223a31313132317d"
         );
         assert_eq!(
             code_remote_authority("dm3", &["-oport=2222".to_string()]).unwrap(),
-            "dm3:2222"
+            "7b22686f73744e616d65223a22646d33222c22706f7274223a323232327d"
         );
     }
 
@@ -1070,11 +1082,11 @@ mod tests {
     fn replaces_existing_code_authority_port() {
         assert_eq!(
             code_remote_authority("user@dm3:22", &["-p11121".to_string()]).unwrap(),
-            "user@dm3:11121"
+            "7b22686f73744e616d65223a22646d33222c2275736572223a2275736572222c22706f7274223a31313132317d"
         );
         assert_eq!(
             code_remote_authority("2001:db8::1", &["-p11121".to_string()]).unwrap(),
-            "[2001:db8::1]:11121"
+            "7b22686f73744e616d65223a22323030313a6462383a3a31222c22706f7274223a31313132317d"
         );
     }
 

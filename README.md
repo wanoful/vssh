@@ -72,8 +72,21 @@ vssh myhost -- -p 2222
 ```
 
 When `-p PORT`, `-pPORT`, or the equivalent `-o Port=PORT` is used, `vssh`
-also includes that port in the VS Code Remote-SSH target. This keeps a remote
-`code .` connection on the same SSH port as the shell opened by `vssh`.
+also includes that port in the VS Code Remote-SSH target using Remote-SSH's
+encoded authority format. This keeps a remote `code .` connection on the same
+SSH port as the shell opened by `vssh` when connecting to a direct hostname.
+
+VS Code Remote-SSH currently discards an authority port after it matches a
+`Host` alias in the local SSH configuration. For an alias, set `Port` in the
+same configuration block so both `vssh` and VS Code use it:
+
+```sshconfig
+Host myhost
+    HostName server.example.com
+    User me
+    IdentityFile ~/.ssh/id_ed25519
+    Port 2222
+```
 
 On Windows, `vssh` searches `PATH` and `PATHEXT` for the VS Code CLI, so the
 usual `code.cmd` shim is supported. If VS Code is not on `PATH`, pass it
