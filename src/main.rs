@@ -1,11 +1,13 @@
 use anyhow::{Context, Result, anyhow, bail};
 use axum::{
     Json, Router,
+    body::Body,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
 };
+use http_body_util::BodyExt;
 use rand::{RngCore, rngs::OsRng};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -16,7 +18,7 @@ use std::{
     process::Stdio,
     sync::Arc,
 };
-use tokio::{net::TcpListener, process::Command, sync::oneshot};
+use tokio::{io::AsyncWriteExt, net::TcpListener, process::Command, sync::oneshot};
 
 const RANDOM_REMOTE_PORT_START: u16 = 40000;
 const RANDOM_REMOTE_PORT_END: u16 = 60999;
@@ -239,6 +241,10 @@ async fn connect(opts: ConnectOptions) -> Result<()> {
         code_host: opts.code_host.clone(),
         code_remote_authority,
         code_bin: opts.code_bin.clone(),
+        local_dir: env::current_dir().context("failed to read local working directory")?,
+        download_dir: dirs::download_dir()
+            .or_else(|| dirs::home_dir().map(|home| home.join("Downloads")))
+            .ok_or_else(|| anyhow!("cannot determine local Downloads directory"))?,
     });
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
@@ -406,12 +412,16 @@ fn shell_quote(value: &str) -> String {
 }
 
 async fn install_shim(opts: InstallShimOptions) -> Result<()> {
-    let remote_command = r#"mkdir -p "$HOME/.local/bin" && tmp="$(mktemp "$HOME/.local/bin/code.XXXXXX")" && cat > "$tmp" && chmod +x "$tmp" && mv "$tmp" "$HOME/.local/bin/code""#;
+    let remote_command = format!(
+        "set -e; mkdir -p \"$HOME/.local/bin\"; {} {}",
+        shim_install_command("code", REMOTE_CODE_SHIM),
+        shim_install_command("vdown", REMOTE_DOWNLOAD_SHIM),
+    );
 
     let mut child = Command::new(&opts.ssh_bin)
         .args(&opts.ssh_args)
         .arg(&opts.host)
-        .arg(remote_command)
+        .arg("sh -s")
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
@@ -425,7 +435,7 @@ async fn install_shim(opts: InstallShimOptions) -> Result<()> {
             .take()
             .ok_or_else(|| anyhow!("failed to open ssh stdin"))?;
         stdin
-            .write_all(REMOTE_CODE_SHIM.as_bytes())
+            .write_all(remote_command.as_bytes())
             .await
             .context("failed to send shim to ssh")?;
         stdin
@@ -440,10 +450,17 @@ async fn install_shim(opts: InstallShimOptions) -> Result<()> {
     }
 
     eprintln!(
-        "vssh: installed remote shim at ~/.local/bin/code on {}",
+        "vssh: installed remote shims at ~/.local/bin/code and ~/.local/bin/vdown on {}",
         opts.host
     );
     Ok(())
+}
+
+fn shim_install_command(name: &str, contents: &str) -> String {
+    format!(
+        "tmp=$(mktemp \"$HOME/.local/bin/{name}.XXXXXX\"); trap 'rm -f \"$tmp\"' EXIT; printf %s {} > \"$tmp\"; chmod +x \"$tmp\"; mv \"$tmp\" \"$HOME/.local/bin/{name}\";",
+        shell_quote(contents)
+    )
 }
 
 #[derive(Clone)]
@@ -452,6 +469,8 @@ struct BridgeState {
     code_host: String,
     code_remote_authority: String,
     code_bin: String,
+    download_dir: PathBuf,
+    local_dir: PathBuf,
 }
 
 async fn run_bridge(
@@ -462,6 +481,7 @@ async fn run_bridge(
     let listener = TcpListener::from_std(listener).context("failed to create tokio listener")?;
     let app = Router::new()
         .route("/open", post(open_handler))
+        .route("/download", post(download_handler))
         .with_state(state);
 
     axum::serve(listener, app)
@@ -470,6 +490,113 @@ async fn run_bridge(
         })
         .await
         .context("bridge HTTP server failed")
+}
+
+#[derive(Debug, Deserialize)]
+struct DownloadMetadata {
+    name: String,
+    destination: Option<String>,
+}
+
+async fn download_handler(
+    State(state): State<Arc<BridgeState>>,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    match handle_download(&state, &headers, body).await {
+        Ok(path) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true, "path": path,
+            })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false, "message": format!("{error:#}"),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+fn download_path(
+    default_dir: &Path,
+    local_dir: &Path,
+    metadata: &DownloadMetadata,
+) -> Result<PathBuf> {
+    let name = &metadata.name;
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name
+            .chars()
+            .any(|ch| ch == '/' || ch == '\\' || ch == ':' || ch.is_control())
+    {
+        bail!("download name must be a plain filename without separators or control characters");
+    }
+    let directory = match metadata.destination.as_deref() {
+        None => default_dir.to_path_buf(),
+        Some("") => bail!("local destination directory must not be empty"),
+        Some(value) if value == "~" || value.starts_with("~/") || value.starts_with("~\\") => {
+            let home =
+                dirs::home_dir().ok_or_else(|| anyhow!("local home directory is not set"))?;
+            home.join(value.get(2..).unwrap_or(""))
+        }
+        Some(value) => local_dir.join(value),
+    };
+    Ok(directory.join(name))
+}
+
+async fn handle_download(
+    state: &BridgeState,
+    headers: &HeaderMap,
+    mut body: Body,
+) -> Result<PathBuf> {
+    authorize(headers, &state.token)?;
+    let metadata: DownloadMetadata = serde_json::from_str(
+        headers
+            .get("x-vssh-download")
+            .ok_or_else(|| anyhow!("missing download metadata"))?
+            .to_str()
+            .context("invalid download metadata header")?,
+    )
+    .context("invalid download metadata")?;
+    let path = download_path(&state.download_dir, &state.local_dir, &metadata)?;
+    let directory = path
+        .parent()
+        .ok_or_else(|| anyhow!("missing destination directory"))?;
+    tokio::fs::create_dir_all(directory)
+        .await
+        .with_context(|| format!("failed to create local directory {}", directory.display()))?;
+    if tokio::fs::symlink_metadata(&path).await.is_ok() {
+        bail!("local file already exists: {}", path.display());
+    }
+
+    // Keep an RAII temporary path so errors and cancelled requests remove partial files.
+    let (file, temporary) = tempfile::Builder::new()
+        .prefix(".vssh-download-")
+        .tempfile_in(directory)
+        .context("failed to create temporary download file")?
+        .into_parts();
+    let mut file = tokio::fs::File::from_std(file);
+    while let Some(frame) = body.frame().await {
+        if let Ok(data) = frame.context("download interrupted")?.into_data() {
+            file.write_all(&data)
+                .await
+                .context("failed to write download")?;
+        }
+    }
+    file.flush().await.context("failed to flush download")?;
+    drop(file);
+    temporary.persist_noclobber(&path).with_context(|| {
+        format!(
+            "failed to save download (existing files are never overwritten): {}",
+            path.display()
+        )
+    })?;
+    Ok(path)
 }
 
 async fn open_handler(
@@ -906,9 +1033,14 @@ Inside the remote shell started by vssh:
   code file.rs
   code -g src/main.rs:42:1
   code -r .
+  vdown file1 file2
+  vdown file1 file2 -d '~/Downloads/project'
+  vdown file1 file2 -- /local/path
 "#
     );
 }
+
+const REMOTE_DOWNLOAD_SHIM: &str = include_str!("vdown.py");
 
 const REMOTE_CODE_SHIM: &str = r#"#!/usr/bin/env python3
 import json
@@ -988,12 +1120,184 @@ if __name__ == "__main__":
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn installs_both_shims() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let fake_ssh = directory.path().join("ssh");
+        // Run the install script in an isolated home, as the remote sh would.
+        std::fs::write(
+            &fake_ssh,
+            format!(
+                "#!/bin/sh\nexport HOME={}\nexec sh -s\n",
+                shell_quote(directory.path().to_str().unwrap())
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        install_shim(InstallShimOptions {
+            host: "test".into(),
+            ssh_bin: fake_ssh.to_str().unwrap().into(),
+            ssh_args: vec![],
+        })
+        .await
+        .unwrap();
+        for (name, contents) in [("code", REMOTE_CODE_SHIM), ("vdown", REMOTE_DOWNLOAD_SHIM)] {
+            let path = directory.path().join(".local/bin").join(name);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+            assert!(is_executable_file(&path));
+        }
+        assert_eq!(
+            std::fs::read_dir(directory.path().join(".local/bin"))
+                .unwrap()
+                .count(),
+            2
+        );
+    }
+
+    fn download_state(directory: &Path) -> BridgeState {
+        BridgeState {
+            token: "test-token".into(),
+            code_host: "test".into(),
+            code_remote_authority: "test".into(),
+            code_bin: "code".into(),
+            download_dir: directory.join("Downloads"),
+            local_dir: directory.to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn download_destinations_and_names() {
+        let state = download_state(Path::new("/local"));
+        let mut metadata = DownloadMetadata {
+            name: "file.txt".into(),
+            destination: None,
+        };
+        assert_eq!(
+            download_path(&state.download_dir, &state.local_dir, &metadata).unwrap(),
+            Path::new("/local/Downloads/file.txt")
+        );
+        metadata.destination = Some("custom".into());
+        assert_eq!(
+            download_path(&state.download_dir, &state.local_dir, &metadata).unwrap(),
+            Path::new("/local/custom/file.txt")
+        );
+        for name in ["", ".", "..", "../escape", "a/b", "a\\b", "C:stream", "a\n"] {
+            metadata.name = name.into();
+            assert!(download_path(&state.download_dir, &state.local_dir, &metadata).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn download_requires_auth_and_refuses_overwrite() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = download_state(directory.path());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-vssh-download", r#"{"name":"test.bin"}"#.parse().unwrap());
+        assert!(
+            handle_download(&state, &headers, Body::empty())
+                .await
+                .is_err()
+        );
+        assert!(!state.download_dir.exists());
+        headers.insert("authorization", "Bearer test-token".parse().unwrap());
+        let path = handle_download(&state, &headers, Body::from("original"))
+            .await
+            .unwrap();
+        assert!(
+            handle_download(&state, &headers, Body::from("replacement"))
+                .await
+                .is_err()
+        );
+        assert_eq!(tokio::fs::read(path).await.unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(&state.download_dir).unwrap().count(), 1);
+    }
+
     #[test]
     fn resolves_no_args_to_cwd() {
         assert_eq!(
             translate_code_args("/home/me/app", &[]).unwrap(),
             vec!["/home/me/app"]
         );
+    }
+
+    #[tokio::test]
+    async fn python_shim_streams_files_to_bridge() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = Arc::new(download_state(directory.path()));
+        let listener = bind_local_listener(None).unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let bridge = tokio::spawn(run_bridge(listener, state.clone(), shutdown_rx));
+        let source = directory.path().join("远程 file ' $.bin");
+        let content: Vec<u8> = (0..3_000_000).map(|i| (i % 251) as u8).collect();
+        tokio::fs::write(&source, &content).await.unwrap();
+        let empty = directory.path().join("empty");
+        tokio::fs::write(&empty, []).await.unwrap();
+        let shim = directory.path().join("vdown.py");
+        tokio::fs::write(&shim, REMOTE_DOWNLOAD_SHIM).await.unwrap();
+        let invoke = |arguments: Vec<OsString>| {
+            let mut command = Command::new("python3");
+            command
+                .arg(&shim)
+                .args(arguments)
+                .env("LOCAL_CODE_BRIDGE", format!("http://{address}"))
+                .env("LOCAL_CODE_TOKEN", &state.token)
+                .env("http_proxy", "http://127.0.0.1:1");
+            command
+        };
+        let output = invoke(vec![source.clone().into(), empty.clone().into()])
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            tokio::fs::read(state.download_dir.join(source.file_name().unwrap()))
+                .await
+                .unwrap(),
+            content
+        );
+        assert_eq!(
+            tokio::fs::read(state.download_dir.join("empty"))
+                .await
+                .unwrap(),
+            b""
+        );
+        let output = invoke(vec![empty.clone().into()]).output().await.unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("already exists"));
+        for flag in ["-d", "--"] {
+            let destination = directory.path().join(format!("custom-{flag}"));
+            let output = invoke(vec![
+                empty.clone().into(),
+                flag.into(),
+                destination.clone().into(),
+            ])
+            .output()
+            .await
+            .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(destination.join("empty").is_file());
+        }
+        // A truncated HTTP body must leave neither a final file nor a partial file.
+        let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+        socket.write_all(b"POST /download HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-token\r\nX-Vssh-Download: {\"name\":\"broken\"}\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort").await.unwrap();
+        socket.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        use tokio::io::AsyncReadExt;
+        socket.read_to_end(&mut response).await.unwrap();
+        let _ = shutdown_tx.send(());
+        bridge.await.unwrap().unwrap();
+        assert_eq!(std::fs::read_dir(&state.download_dir).unwrap().count(), 2);
     }
 
     #[test]

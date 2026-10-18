@@ -1,7 +1,7 @@
 # vssh
 
-`vssh` is an SSH wrapper that lets a remote shell command like `code .` open your
-local VS Code through Remote-SSH.
+`vssh` is an SSH wrapper that lets remote shell commands open your local VS Code
+through Remote-SSH (`code .`) or download remote files to your computer (`vdown`).
 
 The remote `code` command is a small shim. It sends an authenticated request over
 an SSH reverse tunnel to a local bridge. The local bridge runs the real VS Code
@@ -19,7 +19,8 @@ cargo build --release
 
 ## Install the remote shim
 
-Install `~/.local/bin/code` on the remote host:
+Install `~/.local/bin/code` and `~/.local/bin/vdown` on the remote host
+(requires Python 3.7 or newer). Run this again after upgrading to add `vdown`:
 
 ```sh
 vssh install-shim myhost
@@ -96,13 +97,54 @@ explicitly:
 .\vssh.exe --code-bin "$env:LOCALAPPDATA\Programs\Microsoft VS Code\bin\code.cmd" myhost
 ```
 
+## Download remote files
+
+Inside a remote shell started with `vssh`, run:
+
+```sh
+vdown report.pdf
+vdown file1.zip file2.csv
+vdown *.log
+```
+
+Files go to your **local system Downloads directory**, including a custom directory
+configured in your OS. If the OS provides no Downloads location, `~/Downloads` on
+this local computer is used. The directory is created if needed.
+
+Specify a local destination directory with `-d` / `--to`, or a final `-- DIR`:
+
+```sh
+vdown file1 file2 -d '~/Downloads/project'
+vdown file1 file2 -- /local/path
+vdown file1 --to 'C:\Users\me\Downloads'
+```
+
+Quote local `~` paths so the remote shell does not expand them to the remote home.
+Relative local destinations are resolved against the directory where you started
+`vssh`. All plain arguments are remote source files; the last plain argument is
+never guessed to be a local destination. For source names starting with `-`, use
+`./-filename` (`--` is reserved for the local destination).
+
+`vdown` streams file contents over the existing authenticated SSH reverse tunnel;
+it needs no additional SSH connection, scp/rsync, or local VS Code installation.
+It reports the saved local path after each file finishes. Files retain their base
+names; directories and recursive downloads are not supported. Existing files are
+never overwritten, including when two sources have the same base name. Failed or
+interrupted transfers remove their temporary files. With multiple files, failures
+are reported individually, remaining files are attempted, and any failure gives a
+nonzero exit status. Files already completed remain saved. File permissions and
+timestamps are not copied.
+
 ## Security Model
 
 `vssh` binds the bridge to `127.0.0.1`, creates a per-session random token, and
 uses SSH reverse forwarding to expose the bridge only to the remote loopback
-address. The bridge does not execute arbitrary remote-provided commands. It only
-translates a small allowlist of VS Code CLI arguments and invokes the configured
-local `code` binary.
+address. The bridge translates a small allowlist of VS Code CLI arguments and
+invokes the configured local `code` binary. Download requests stream bytes into
+local files without executing remote-provided commands. Filenames must be plain
+base names, and publication of completed files refuses to overwrite existing paths.
+An authenticated remote shell can choose a local destination directory writable
+by your local user, so use `vssh` with remote hosts you trust.
 
 Supported remote `code` forms:
 
