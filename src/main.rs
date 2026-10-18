@@ -32,7 +32,7 @@ async fn main() -> Result<()> {
         Cli::Connect(opts) => connect(opts).await,
         Cli::InstallShim(opts) => install_shim(opts).await,
         Cli::PrintShim => {
-            print!("{REMOTE_CODE_SHIM}");
+            print!("{}", REMOTE_CODE_SHIM.replace("\r\n", "\n"));
             Ok(())
         }
         Cli::Help => {
@@ -459,7 +459,8 @@ async fn install_shim(opts: InstallShimOptions) -> Result<()> {
 fn shim_install_command(name: &str, contents: &str) -> String {
     format!(
         "tmp=$(mktemp \"$HOME/.local/bin/{name}.XXXXXX\"); trap 'rm -f \"$tmp\"' EXIT; printf %s {} > \"$tmp\"; chmod +x \"$tmp\"; mv \"$tmp\" \"$HOME/.local/bin/{name}\";",
-        shell_quote(contents)
+        // include_str! preserves Windows checkout line endings, including the shebang.
+        shell_quote(&contents.replace("\r\n", "\n"))
     )
 }
 
@@ -1120,6 +1121,15 @@ if __name__ == "__main__":
 mod tests {
     use super::*;
 
+    #[test]
+    fn normalizes_windows_shim_line_endings() {
+        let lf = "#!/usr/bin/env python3\nprint('hello')\n";
+        assert_eq!(
+            shim_install_command("vdown", &lf.replace('\n', "\r\n")),
+            shim_install_command("vdown", lf)
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn installs_both_shims() {
@@ -1143,11 +1153,39 @@ mod tests {
         })
         .await
         .unwrap();
+        // Simulate shims embedded from a Windows CRLF checkout and reinstall them.
+        let script = format!(
+            "set -e; {} {}",
+            shim_install_command("code", &REMOTE_CODE_SHIM.replace('\n', "\r\n")),
+            shim_install_command("vdown", &REMOTE_DOWNLOAD_SHIM.replace('\n', "\r\n")),
+        );
+        assert!(!script.contains('\r'));
+        let mut child = Command::new(&fake_ssh)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(script.as_bytes()).await.unwrap();
+        drop(stdin);
+        assert!(child.wait().await.unwrap().success());
         for (name, contents) in [("code", REMOTE_CODE_SHIM), ("vdown", REMOTE_DOWNLOAD_SHIM)] {
             let path = directory.path().join(".local/bin").join(name);
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), contents);
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                contents.replace("\r\n", "\n")
+            );
             assert!(is_executable_file(&path));
         }
+        let output = Command::new(directory.path().join(".local/bin/vdown"))
+            .arg("--help")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert_eq!(
             std::fs::read_dir(directory.path().join(".local/bin"))
                 .unwrap()
