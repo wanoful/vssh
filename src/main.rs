@@ -493,10 +493,16 @@ async fn run_bridge(
         .context("bridge HTTP server failed")
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct DownloadMetadata {
     name: String,
     destination: Option<String>,
+    #[serde(default)]
+    relative_dir: Vec<String>,
+    #[serde(default)]
+    directory: bool,
+    #[serde(default)]
+    force: bool,
 }
 
 async fn download_handler(
@@ -527,15 +533,22 @@ fn download_path(
     local_dir: &Path,
     metadata: &DownloadMetadata,
 ) -> Result<PathBuf> {
-    let name = &metadata.name;
-    if name.is_empty()
-        || name == "."
-        || name == ".."
-        || name
-            .chars()
-            .any(|ch| ch == '/' || ch == '\\' || ch == ':' || ch.is_control())
+    for name in metadata
+        .relative_dir
+        .iter()
+        .chain(std::iter::once(&metadata.name))
     {
-        bail!("download name must be a plain filename without separators or control characters");
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name
+                .chars()
+                .any(|ch| ch == '/' || ch == '\\' || ch == ':' || ch.is_control())
+        {
+            bail!(
+                "download name must be a plain filename without separators or control characters"
+            );
+        }
     }
     let directory = match metadata.destination.as_deref() {
         None => default_dir.to_path_buf(),
@@ -547,7 +560,11 @@ fn download_path(
         }
         Some(value) => local_dir.join(value),
     };
-    Ok(directory.join(name))
+    let mut path = directory;
+    for component in &metadata.relative_dir {
+        path.push(component);
+    }
+    Ok(path.join(&metadata.name))
 }
 
 async fn handle_download(
@@ -568,10 +585,31 @@ async fn handle_download(
     let directory = path
         .parent()
         .ok_or_else(|| anyhow!("missing destination directory"))?;
+    // Do not follow existing symlinks inside a downloaded tree.
+    for component in path
+        .ancestors()
+        .skip(usize::from(!metadata.directory))
+        .take(metadata.relative_dir.len() + usize::from(metadata.directory))
+    {
+        if let Ok(info) = tokio::fs::symlink_metadata(component).await
+            && info.file_type().is_symlink()
+        {
+            bail!(
+                "local download directory is a symlink: {}",
+                component.display()
+            );
+        }
+    }
+    if metadata.directory {
+        tokio::fs::create_dir_all(&path)
+            .await
+            .with_context(|| format!("failed to create local directory {}", path.display()))?;
+        return Ok(path);
+    }
     tokio::fs::create_dir_all(directory)
         .await
         .with_context(|| format!("failed to create local directory {}", directory.display()))?;
-    if tokio::fs::symlink_metadata(&path).await.is_ok() {
+    if !metadata.force && tokio::fs::symlink_metadata(&path).await.is_ok() {
         bail!("local file already exists: {}", path.display());
     }
 
@@ -591,12 +629,12 @@ async fn handle_download(
     }
     file.flush().await.context("failed to flush download")?;
     drop(file);
-    temporary.persist_noclobber(&path).with_context(|| {
-        format!(
-            "failed to save download (existing files are never overwritten): {}",
-            path.display()
-        )
-    })?;
+    if metadata.force {
+        temporary.persist(&path)
+    } else {
+        temporary.persist_noclobber(&path)
+    }
+    .with_context(|| format!("failed to save download: {}", path.display()))?;
     Ok(path)
 }
 
@@ -1035,6 +1073,7 @@ Inside the remote shell started by vssh:
   code -g src/main.rs:42:1
   code -r .
   vdown file1 file2
+  vdown -rf logs
   vdown file1 file2 -d '~/Downloads/project'
   vdown file1 file2 -- /local/path
 "#
@@ -1211,6 +1250,7 @@ mod tests {
         let mut metadata = DownloadMetadata {
             name: "file.txt".into(),
             destination: None,
+            ..Default::default()
         };
         assert_eq!(
             download_path(&state.download_dir, &state.local_dir, &metadata).unwrap(),
@@ -1225,6 +1265,9 @@ mod tests {
             metadata.name = name.into();
             assert!(download_path(&state.download_dir, &state.local_dir, &metadata).is_err());
         }
+        metadata.name = "file.txt".into();
+        metadata.relative_dir = vec!["..".into()];
+        assert!(download_path(&state.download_dir, &state.local_dir, &metadata).is_err());
     }
 
     #[tokio::test]
@@ -1248,7 +1291,15 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(tokio::fs::read(path).await.unwrap(), b"original");
+        assert_eq!(tokio::fs::read(&path).await.unwrap(), b"original");
+        headers.insert(
+            "x-vssh-download",
+            r#"{"name":"test.bin","force":true}"#.parse().unwrap(),
+        );
+        handle_download(&state, &headers, Body::from("replacement"))
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(path).await.unwrap(), b"replacement");
         assert_eq!(std::fs::read_dir(&state.download_dir).unwrap().count(), 1);
     }
 
@@ -1326,15 +1377,86 @@ mod tests {
             );
             assert!(destination.join("empty").is_file());
         }
-        // A truncated HTTP body must leave neither a final file nor a partial file.
+        let tree = directory.path().join("tree");
+        tokio::fs::create_dir_all(tree.join("nested/empty-dir"))
+            .await
+            .unwrap();
+        tokio::fs::write(tree.join("nested/file.txt"), b"remote")
+            .await
+            .unwrap();
+        let destination = directory.path().join("recursive-output");
+        let output = invoke(vec![
+            tree.clone().into(),
+            "-d".into(),
+            destination.clone().into(),
+        ])
+        .output()
+        .await
+        .unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("requires -r"));
+        let recursive_args = |flag: &str| {
+            vec![
+                flag.into(),
+                tree.clone().into(),
+                "--".into(),
+                destination.clone().into(),
+            ]
+        };
+        let output = invoke(recursive_args("-r")).output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let saved = destination.join("tree/nested/file.txt");
+        assert_eq!(tokio::fs::read(&saved).await.unwrap(), b"remote");
+        assert!(destination.join("tree/nested/empty-dir").is_dir());
+        tokio::fs::write(&saved, b"local").await.unwrap();
+        assert!(
+            !invoke(recursive_args("-r"))
+                .output()
+                .await
+                .unwrap()
+                .status
+                .success()
+        );
+        assert_eq!(tokio::fs::read(&saved).await.unwrap(), b"local");
+        let output = invoke(recursive_args("-rf")).output().await.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(tokio::fs::read(&saved).await.unwrap(), b"remote");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&tree, tree.join("loop")).unwrap();
+            let output = invoke(recursive_args("-rf")).output().await.unwrap();
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("symlinks are not followed"));
+            assert!(!destination.join("tree/loop").exists());
+            std::fs::remove_file(tree.join("loop")).unwrap();
+            std::fs::remove_dir(destination.join("tree/nested/empty-dir")).unwrap();
+            std::os::unix::fs::symlink(directory.path(), destination.join("tree/nested/empty-dir"))
+                .unwrap();
+            let output = invoke(recursive_args("-rf")).output().await.unwrap();
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("directory is a symlink"));
+        }
+        // A truncated forced overwrite must preserve the old file and clean up its temporary file.
         let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
-        socket.write_all(b"POST /download HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-token\r\nX-Vssh-Download: {\"name\":\"broken\"}\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort").await.unwrap();
+        socket.write_all(b"POST /download HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-token\r\nX-Vssh-Download: {\"name\":\"empty\",\"force\":true}\r\nContent-Length: 100\r\nConnection: close\r\n\r\nshort").await.unwrap();
         socket.shutdown().await.unwrap();
         let mut response = Vec::new();
         use tokio::io::AsyncReadExt;
         socket.read_to_end(&mut response).await.unwrap();
         let _ = shutdown_tx.send(());
         bridge.await.unwrap().unwrap();
+        assert_eq!(
+            std::fs::read(state.download_dir.join("empty")).unwrap(),
+            b""
+        );
         assert_eq!(std::fs::read_dir(&state.download_dir).unwrap().count(), 2);
     }
 

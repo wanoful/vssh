@@ -99,12 +99,17 @@ explicitly:
 
 ## Download remote files
 
+After upgrading, rebuild the local binary and rerun `vssh install-shim myhost`
+to update the remote command, then reconnect with the updated `vssh`.
+
 Inside a remote shell started with `vssh`, run:
 
 ```sh
 vdown report.pdf
 vdown file1.zip file2.csv
 vdown *.log
+vdown -r logs
+vdown -rf logs -d '~/Downloads/project'
 ```
 
 Files go to your **local system Downloads directory**, including a custom directory
@@ -128,9 +133,17 @@ never guessed to be a local destination. For source names starting with `-`, use
 `vdown` streams file contents over the existing authenticated SSH reverse tunnel;
 it needs no additional SSH connection, scp/rsync, or local VS Code installation.
 It reports the saved local path after each file finishes. Files retain their base
-names; directories and recursive downloads are not supported. Existing files are
-never overwritten, including when two sources have the same base name. Failed or
-interrupted transfers remove their temporary files. With multiple files, failures
+names. Use `-r` / `--recursive` to download directories, preserving their top-level
+directory, nested structure, and empty directories (for example, `vdown -r logs`
+creates `Downloads/logs/`). Existing directories are merged. Directory symlinks
+are not followed and are reported as failures; symlinks to regular files copy the
+target contents. Special files such as sockets and FIFOs are rejected.
+
+Existing files are refused by default. Use `-f` / `--force` to replace them, or
+combine both options as `-rf`. Replacement happens only after the entire file
+arrives, so a failed transfer preserves the old file. `-f` does not remove existing
+directories or resolve file/directory conflicts. Failed or interrupted transfers
+remove their temporary files. With multiple files, failures
 are reported individually, remaining files are attempted, and any failure gives a
 nonzero exit status. Files already completed remain saved. File permissions and
 timestamps are not copied.
@@ -142,7 +155,9 @@ uses SSH reverse forwarding to expose the bridge only to the remote loopback
 address. The bridge translates a small allowlist of VS Code CLI arguments and
 invokes the configured local `code` binary. Download requests stream bytes into
 local files without executing remote-provided commands. Filenames must be plain
-base names, and publication of completed files refuses to overwrite existing paths.
+base names, including each component of a recursive path. Recursive paths reject
+parent traversal and existing directory symlinks within the downloaded tree.
+Completed files replace existing files only when `-f` is explicitly supplied.
 An authenticated remote shell can choose a local destination directory writable
 by your local user, so use `vssh` with remote hosts you trust.
 
