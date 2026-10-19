@@ -8,6 +8,7 @@ import stat
 import sys
 import urllib.error
 import urllib.request
+from vssh_bridge import connection
 
 
 def parse_args(argv):
@@ -37,8 +38,12 @@ def parse_args(argv):
 
 def main():
     args = parse_args(sys.argv[1:])
-    bridge = os.environ.get("LOCAL_CODE_BRIDGE")
-    token = os.environ.get("LOCAL_CODE_TOKEN")
+    try:
+        current = connection()
+    except Exception as error:
+        print("vdown: {}".format(error), file=sys.stderr)
+        return 1
+    bridge, token = current["bridge"], current["token"]
     if not bridge or not token:
         print("vdown: start this shell with `vssh <host>`.", file=sys.stderr)
         return 1

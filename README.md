@@ -28,6 +28,52 @@ vssh install-shim myhost
 
 Make sure `~/.local/bin` is before any real `code` binary in the remote `PATH`.
 
+## Optional Zellij integration
+
+Install the Zellij wrapper explicitly (the default install does not install it):
+
+```sh
+vssh install-shim --with-zellij myhost
+```
+
+Then connect and attach normally, without a separate binding command:
+
+```sh
+vssh myhost
+# On the remote host:
+zellij attach -c work
+vdown report.pdf
+code .
+```
+
+The wrapper records the attaching vssh connection for that Zellij session.
+`vdown` and `code` read the association on each invocation, so existing panes
+use the new bridge after reconnecting and attaching again, even if they retain
+old or missing vssh environment variables. Different Zellij sessions are independent.
+When multiple vssh connections attach the same session, the last attach selects
+the local computer for all its panes. Detaching does not restore an older target;
+reattach from the desired vssh connection to select it again. An SSH connection
+must remain open for its tunnel to work.
+
+Supported forms include `zellij attach NAME`, `zellij a -c NAME`, `zellij -s NAME`,
+and unnamed attach when there is one unambiguous session. Plain `zellij` and
+`zellij attach -c` with no existing sessions create a name beginning with `vssh-`.
+With multiple sessions, use a name instead of an interactive session picker.
+Switching sessions via the Zellij UI, renaming sessions, and Zellij's HTTPS remote
+client are not tracked; reattach by name through the wrapper when changing sessions.
+
+The real Zellij must be installed on the remote host. Keep `~/.local/bin` first in
+`PATH` and invoke `zellij` by name so the wrapper runs. If a real executable already
+occupies `~/.local/bin/zellij`, the installer preserves it as `zellij.vssh-real`;
+otherwise the wrapper finds Zellij elsewhere in `PATH`. Without a vssh connection,
+the wrapper delegates unchanged. Rerun installation with `--with-zellij` when upgrading
+the wrapper. Omitting the flag leaves an already installed wrapper in place.
+
+Associations are stored under `~/.local/state/vssh/zellij` with private directory
+and file permissions. To remove the integration, remove only `~/.local/bin/zellij`
+and restore `zellij.vssh-real` to `zellij` if that backup exists.
+Remove `~/.local/state/vssh/zellij` as well to clear associations used by existing panes.
+
 ## Connect
 
 Start SSH through `vssh`:
@@ -174,3 +220,18 @@ Supported remote `code` forms:
 - `code --wait <path>`
 
 Unknown flags are rejected by the local bridge.
+
+## Tests
+
+```sh
+cargo test
+python3 -m unittest discover -s tests
+```
+
+On a POSIX host with Zellij installed, verify reattaching an actual persistent session and routing
+both commands from its old pane to the new connection:
+
+```sh
+cargo build --release
+python3 tests/zellij_smoke.py target/release/vssh
+```

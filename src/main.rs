@@ -32,7 +32,7 @@ async fn main() -> Result<()> {
         Cli::Connect(opts) => connect(opts).await,
         Cli::InstallShim(opts) => install_shim(opts).await,
         Cli::PrintShim => {
-            print!("{}", REMOTE_CODE_SHIM.replace("\r\n", "\n"));
+            print!("{}", render_shim(REMOTE_CODE_SHIM));
             Ok(())
         }
         Cli::Help => {
@@ -63,6 +63,7 @@ struct ConnectOptions {
 
 #[derive(Debug)]
 struct InstallShimOptions {
+    with_zellij: bool,
     host: String,
     ssh_bin: String,
     ssh_args: Vec<String>,
@@ -170,6 +171,7 @@ fn parse_connect(args: &[String]) -> Result<ConnectOptions> {
 }
 
 fn parse_install_shim(args: &[String]) -> Result<InstallShimOptions> {
+    let mut with_zellij = false;
     let mut ssh_bin = env::var("VSSH_SSH").unwrap_or_else(|_| "ssh".to_string());
     let mut host = None;
     let mut ssh_args = Vec::new();
@@ -181,12 +183,15 @@ fn parse_install_shim(args: &[String]) -> Result<InstallShimOptions> {
                 ssh_args.extend(args[i + 1..].iter().cloned());
                 break;
             }
+            "--with-zellij" => with_zellij = true,
             "--ssh-bin" => {
                 i += 1;
                 ssh_bin = parse_value(args.get(i), "--ssh-bin")?.to_string();
             }
             "-h" | "--help" => {
-                bail!("usage: vssh install-shim [--ssh-bin PATH] <host> [-- raw ssh args]");
+                bail!(
+                    "usage: vssh install-shim [--with-zellij] [--ssh-bin PATH] <host> [-- raw ssh args]"
+                );
             }
             flag if flag.starts_with('-') => {
                 bail!("unknown install-shim option `{flag}`; put raw ssh arguments after `--`");
@@ -203,6 +208,7 @@ fn parse_install_shim(args: &[String]) -> Result<InstallShimOptions> {
     }
 
     Ok(InstallShimOptions {
+        with_zellij,
         host: host.ok_or_else(|| anyhow!("missing SSH host"))?,
         ssh_bin,
         ssh_args,
@@ -412,11 +418,16 @@ fn shell_quote(value: &str) -> String {
 }
 
 async fn install_shim(opts: InstallShimOptions) -> Result<()> {
-    let remote_command = format!(
+    let mut remote_command = format!(
         "set -e; mkdir -p \"$HOME/.local/bin\"; {} {}",
         shim_install_command("code", REMOTE_CODE_SHIM),
         shim_install_command("vdown", REMOTE_DOWNLOAD_SHIM),
     );
+    if opts.with_zellij {
+        // Preserve a real Zellij installed in ~/.local/bin before taking its name.
+        remote_command.push_str(r#"if { [ -e "$HOME/.local/bin/zellij" ] || [ -L "$HOME/.local/bin/zellij" ]; } && ! grep -q '^# vssh-zellij-shim$' "$HOME/.local/bin/zellij"; then if [ -e "$HOME/.local/bin/zellij.vssh-real" ] || [ -L "$HOME/.local/bin/zellij.vssh-real" ]; then echo 'vssh: refusing to overwrite existing zellij.vssh-real backup' >&2; exit 1; fi; mv "$HOME/.local/bin/zellij" "$HOME/.local/bin/zellij.vssh-real"; fi; "#);
+        remote_command.push_str(&shim_install_command("zellij", REMOTE_ZELLIJ_SHIM));
+    }
 
     let mut child = Command::new(&opts.ssh_bin)
         .args(&opts.ssh_args)
@@ -453,6 +464,9 @@ async fn install_shim(opts: InstallShimOptions) -> Result<()> {
         "vssh: installed remote shims at ~/.local/bin/code and ~/.local/bin/vdown on {}",
         opts.host
     );
+    if opts.with_zellij {
+        eprintln!("vssh: installed optional remote shim at ~/.local/bin/zellij");
+    }
     Ok(())
 }
 
@@ -460,7 +474,7 @@ fn shim_install_command(name: &str, contents: &str) -> String {
     format!(
         "tmp=$(mktemp \"$HOME/.local/bin/{name}.XXXXXX\"); trap 'rm -f \"$tmp\"' EXIT; printf %s {} > \"$tmp\"; chmod +x \"$tmp\"; mv \"$tmp\" \"$HOME/.local/bin/{name}\";",
         // include_str! preserves Windows checkout line endings, including the shebang.
-        shell_quote(&contents.replace("\r\n", "\n"))
+        shell_quote(&render_shim(contents))
     )
 }
 
@@ -1062,8 +1076,13 @@ Connect options:
   --ssh-bin PATH       SSH executable. Defaults to $VSSH_SSH or ssh.
   --code-bin PATH      Local VS Code CLI. Defaults to $VSSH_CODE or code.
 
+Install-shim options:
+  --with-zellij        Also install the optional Zellij wrapper for automatic session association.
+  --ssh-bin PATH       SSH executable. Defaults to $VSSH_SSH or ssh.
+
 Examples:
   vssh install-shim devbox
+  vssh install-shim --with-zellij devbox
   vssh devbox
   vssh --code-host devbox-alias user@example.com
 
@@ -1082,83 +1101,41 @@ Inside the remote shell started by vssh:
 
 const REMOTE_DOWNLOAD_SHIM: &str = include_str!("vdown.py");
 
-const REMOTE_CODE_SHIM: &str = r#"#!/usr/bin/env python3
-import json
-import os
-import shutil
-import subprocess
-import sys
-import urllib.error
-import urllib.request
+const REMOTE_CODE_SHIM: &str = include_str!("code.py");
+const REMOTE_ZELLIJ_SHIM: &str = include_str!("zellij.py");
+const REMOTE_BRIDGE_HELPER: &str = include_str!("vssh_bridge.py");
 
-
-def find_real_code():
-    self_path = os.path.realpath(sys.argv[0])
-    for directory in os.environ.get("PATH", "").split(os.pathsep):
-        if not directory:
-            continue
-        candidate = os.path.join(directory, "code")
-        if os.path.realpath(candidate) == self_path:
-            continue
-        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
-            return candidate
-    return None
-
-
-def fallback():
-    real_code = find_real_code()
-    if real_code:
-        os.execv(real_code, [real_code] + sys.argv[1:])
-    print(
-        "vssh: LOCAL_CODE_BRIDGE is not set. Start this shell with `vssh <host>`.",
-        file=sys.stderr,
-    )
-    return 127
-
-
-def main():
-    bridge = os.environ.get("LOCAL_CODE_BRIDGE")
-    token = os.environ.get("LOCAL_CODE_TOKEN")
-    host = os.environ.get("LOCAL_CODE_SSH_HOST")
-    if not bridge or not token or not host:
-        return fallback()
-
-    payload = {
-        "host": host,
-        "cwd": os.getcwd(),
-        "args": sys.argv[1:],
+fn render_shim(contents: &str) -> String {
+    let mut result = String::new();
+    for line in contents.lines() {
+        if line.starts_with("from vssh_bridge import ") {
+            result.push_str(REMOTE_BRIDGE_HELPER.replace("\r\n", "\n").trim_end());
+        } else {
+            result.push_str(line);
+        }
+        result.push('\n');
     }
-    body = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        bridge.rstrip("/") + "/open",
-        data=body,
-        method="POST",
-        headers={
-            "Authorization": "Bearer " + token,
-            "Content-Type": "application/json",
-        },
-    )
-
-    try:
-        with urllib.request.urlopen(request, timeout=None) as response:
-            response.read()
-        return 0
-    except urllib.error.HTTPError as error:
-        message = error.read().decode("utf-8", errors="replace")
-        print("vssh: local code bridge rejected the request:", message, file=sys.stderr)
-        return 1
-    except Exception as error:
-        print("vssh: failed to reach local code bridge: {}".format(error), file=sys.stderr)
-        return 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
-"#;
+    result
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zellij_installation_is_opt_in() {
+        let default = parse_install_shim(&["host".into()]).unwrap();
+        assert!(!default.with_zellij);
+        let optional = parse_install_shim(&[
+            "--with-zellij".into(),
+            "host".into(),
+            "--".into(),
+            "-p2222".into(),
+        ])
+        .unwrap();
+        assert!(optional.with_zellij);
+        assert_eq!(optional.ssh_args, vec!["-p2222"]);
+    }
 
     #[test]
     fn normalizes_windows_shim_line_endings() {
@@ -1167,6 +1144,13 @@ mod tests {
             shim_install_command("vdown", &lf.replace('\n', "\r\n")),
             shim_install_command("vdown", lf)
         );
+        for source in [REMOTE_CODE_SHIM, REMOTE_DOWNLOAD_SHIM, REMOTE_ZELLIJ_SHIM] {
+            let lf = source.replace("\r\n", "\n");
+            let rendered = render_shim(&lf.replace('\n', "\r\n"));
+            assert_eq!(rendered, render_shim(&lf));
+            assert!(!rendered.contains('\r'));
+            assert!(!rendered.contains("from vssh_bridge import "));
+        }
     }
 
     #[cfg(unix)]
@@ -1186,6 +1170,7 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
         install_shim(InstallShimOptions {
+            with_zellij: false,
             host: "test".into(),
             ssh_bin: fake_ssh.to_str().unwrap().into(),
             ssh_args: vec![],
@@ -1211,7 +1196,7 @@ mod tests {
             let path = directory.path().join(".local/bin").join(name);
             assert_eq!(
                 std::fs::read_to_string(&path).unwrap(),
-                contents.replace("\r\n", "\n")
+                render_shim(contents)
             );
             assert!(is_executable_file(&path));
         }
@@ -1230,6 +1215,41 @@ mod tests {
                 .unwrap()
                 .count(),
             2
+        );
+        let original = "#!/bin/sh\nexit 42\n";
+        let zellij = directory.path().join(".local/bin/zellij");
+        std::fs::write(&zellij, original).unwrap();
+        std::fs::set_permissions(&zellij, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Installing and upgrading the opt-in wrapper must preserve a colocated real binary.
+        for _ in 0..2 {
+            install_shim(InstallShimOptions {
+                with_zellij: true,
+                host: "test".into(),
+                ssh_bin: fake_ssh.to_str().unwrap().into(),
+                ssh_args: vec![],
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(&zellij).unwrap(),
+                render_shim(REMOTE_ZELLIJ_SHIM)
+            );
+            assert_eq!(
+                std::fs::read_to_string(directory.path().join(".local/bin/zellij.vssh-real"))
+                    .unwrap(),
+                original
+            );
+        }
+        let output = Command::new(&zellij)
+            .arg("--version")
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(42),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
@@ -1325,7 +1345,9 @@ mod tests {
         let empty = directory.path().join("empty");
         tokio::fs::write(&empty, []).await.unwrap();
         let shim = directory.path().join("vdown.py");
-        tokio::fs::write(&shim, REMOTE_DOWNLOAD_SHIM).await.unwrap();
+        tokio::fs::write(&shim, render_shim(REMOTE_DOWNLOAD_SHIM))
+            .await
+            .unwrap();
         let invoke = |arguments: Vec<OsString>| {
             let mut command = Command::new("python3");
             command
