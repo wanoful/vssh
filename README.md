@@ -57,7 +57,9 @@ must remain open for its tunnel to work.
 
 Supported forms include `zellij attach NAME`, `zellij a -c NAME`, `zellij -s NAME`,
 and unnamed attach when there is one unambiguous session. Plain `zellij` and
-`zellij attach -c` with no existing sessions create a name beginning with `vssh-`.
+`zellij attach -c` retain Zellij's native random names and configured session names.
+For a new unnamed session, the first `code` or `vdown` invocation discovers the
+actual session name from the pane and records its connection automatically.
 With multiple sessions, use a name instead of an interactive session picker.
 Switching sessions via the Zellij UI, renaming sessions, and Zellij's HTTPS remote
 client are not tracked; reattach by name through the wrapper when changing sessions.

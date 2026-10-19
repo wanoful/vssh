@@ -17,6 +17,10 @@ def find_real_program(name):
             candidates.append(os.path.join(directory, name))
     for candidate in candidates:
         if os.path.realpath(candidate) != own_path and os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            if name == "zellij":
+                with open(candidate, "rb") as stream:
+                    if b"# vssh-zellij-shim" in stream.read(256).splitlines():
+                        continue  # Multiple shim locations in PATH must not call each other.
             return candidate
     return None
 
@@ -36,7 +40,7 @@ def _check_private(path, directory=False):
         raise RuntimeError("unsafe vssh binding permissions: {}".format(path))
 
 
-def bind_session(session, current):
+def bind_session(session, current, if_absent=False):
     if not all(current.get(key) for key in ("bridge", "token", "host")):
         return
     directory, path = _binding_path(session)
@@ -46,33 +50,49 @@ def bind_session(session, current):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
             json.dump(current, stream)
-        os.replace(temporary, path)
+        if if_absent:
+            try:
+                os.link(temporary, path)
+            except FileExistsError:
+                pass  # A newer attach/first invocation already published a binding.
+        else:
+            os.replace(temporary, path)
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
 
 
+def _read_binding(directory, path):
+    _check_private(directory, directory=True)
+    _check_private(path)
+    with open(path, encoding="utf-8") as stream:
+        current = json.load(stream)
+    if not isinstance(current, dict) or not all(
+        isinstance(current.get(key), str) and current[key]
+        for key in ("bridge", "token", "host")
+    ):
+        raise ValueError("incomplete connection data")
+    return current
+
+
 def connection():
-    session = os.environ.get("ZELLIJ_SESSION_NAME") if "ZELLIJ" in os.environ else None
-    if session:
-        directory, path = _binding_path(session)
-        try:
-            _check_private(directory, directory=True)
-            _check_private(path)
-            with open(path, encoding="utf-8") as stream:
-                current = json.load(stream)
-            if not isinstance(current, dict) or not all(
-                isinstance(current.get(key), str) and current[key]
-                for key in ("bridge", "token", "host")
-            ):
-                raise ValueError("incomplete connection data")
-            return current
-        except FileNotFoundError:
-            pass
-        except Exception as error:
-            raise RuntimeError("cannot read Zellij vssh binding; reattach through vssh: {}".format(error)) from error
-    return {
+    current = {
         "bridge": os.environ.get("LOCAL_CODE_BRIDGE"),
         "token": os.environ.get("LOCAL_CODE_TOKEN"),
         "host": os.environ.get("LOCAL_CODE_SSH_HOST"),
     }
+    session = os.environ.get("ZELLIJ_SESSION_NAME") if "ZELLIJ" in os.environ else None
+    if session:
+        directory, path = _binding_path(session)
+        try:
+            try:
+                return _read_binding(directory, path)
+            except FileNotFoundError:
+                if os.environ.get("VSSH_ZELLIJ_AUTO_BIND") == "1" and all(current.values()):
+                    # The native session name is now known. Never overwrite a binding
+                    # published by a concurrent reattach using stale pane variables.
+                    bind_session(session, current, if_absent=True)
+                    return _read_binding(directory, path)
+        except Exception as error:
+            raise RuntimeError("cannot read Zellij vssh binding; reattach through vssh: {}".format(error)) from error
+    return current

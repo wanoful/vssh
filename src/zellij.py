@@ -4,7 +4,6 @@
 import os
 import subprocess
 import sys
-import uuid
 from vssh_bridge import bind_session, connection, find_real_program
 
 
@@ -64,10 +63,7 @@ def attach_target(real, args):
         return None, args
     named, global_args, i = options
     if i == len(args):
-        # A plain launch creates a new named session. An explicit -s is preserved.
-        if not named:
-            named = "vssh-" + uuid.uuid4().hex[:12]
-            args = ["--session", named] + args
+        # Zellij owns random/configured names. A new pane can discover its actual name.
         return named, args
     if args[i] not in ("attach", "a"):
         return None, args
@@ -118,10 +114,7 @@ def attach_target(real, args):
     if len(sessions) == 1:
         return sessions[0], args
     if not sessions and create:
-        target = "vssh-" + uuid.uuid4().hex[:12]
-        # Insert before '--' / options so initial commands keep their meaning.
-        args.insert(i, target)
-        return target, args
+        return None, args
     print("vssh: automatic Zellij association needs an unambiguous session; use `zellij attach <name>`.", file=sys.stderr)
     return None, args
 
@@ -142,6 +135,9 @@ def main():
             target, args = attach_target(real, args)
             if target:
                 bind_session(target, current)
+            # New sessions retain the connection in their pane environments. Discover
+            # their native name on first code/vdown invocation, without rewriting argv.
+            os.environ["VSSH_ZELLIJ_AUTO_BIND"] = "1"
     except Exception as error:
         print("vssh: cannot associate Zellij session: {}".format(error), file=sys.stderr)
         return 1

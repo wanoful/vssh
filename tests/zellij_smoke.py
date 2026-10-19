@@ -5,7 +5,6 @@ import os
 from pathlib import Path
 import pty
 import shlex
-import shutil
 import signal
 import struct
 import subprocess
@@ -13,7 +12,9 @@ import sys
 import tempfile
 import threading
 import time
-import uuid
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from vssh_bridge import find_real_program
 
 
 def wait_for(check, description):
@@ -25,8 +26,43 @@ def wait_for(check, description):
     raise AssertionError("timed out: " + description)
 
 
+def start_client(shim, args, environment):
+    fd, slave = pty.openpty()
+    import fcntl
+    import termios
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
+    # Set the controlling terminal in a fresh interpreter, avoiding fork-with-threads.
+    setup = "import fcntl,termios,os,sys; fcntl.ioctl(0,termios.TIOCSCTTY,0); os.execv(sys.argv[1],sys.argv[1:])"
+    client = subprocess.Popen([sys.executable, "-c", setup, str(shim)] + args,
+                              env=environment, stdin=slave, stdout=slave, stderr=slave,
+                              start_new_session=True)
+    os.close(slave)
+    output = bytearray()
+    def drain():
+        try:
+            while True:
+                data = os.read(fd, 65536)
+                if not data:
+                    break
+                output.extend(data)
+                del output[:-4000]
+        except OSError:
+            pass
+    threading.Thread(target=drain, daemon=True).start()
+    return client, fd, output
+
+
+def stop_client(client, fd):
+    try:
+        os.killpg(client.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    client.wait(timeout=5)
+    os.close(fd)
+
+
 def main():
-    real = shutil.which("zellij")
+    real = find_real_program("zellij")
     if not real:
         raise SystemExit("zellij is required")
     binary = str(Path(sys.argv[1]).resolve())
@@ -49,8 +85,7 @@ def main():
     for label, server in zip(["A", "B"], servers):
         server.label = label
         threading.Thread(target=server.serve_forever, daemon=True).start()
-    client = None
-    master = None
+    clients = []
     with tempfile.TemporaryDirectory(prefix="vssh-zellij-smoke-") as temporary:
         root = Path(temporary)
         env = dict(os.environ, HOME=temporary, ZELLIJ_SOCKET_DIR=str(root / "sockets"),
@@ -69,38 +104,42 @@ def main():
             return dict(env, LOCAL_CODE_BRIDGE="http://127.0.0.1:{}".format(server.server_port),
                         LOCAL_CODE_TOKEN="fake-" + label, LOCAL_CODE_SSH_HOST="host-" + label)
         a, b = connection("A", servers[0]), connection("B", servers[1])
-        session = "vssh-smoke-" + uuid.uuid4().hex[:12]
+        session = None
+        session_file = root / "session-name"
         source = root / "remote.txt"
         source.write_bytes(b"remote-file-content")
         ready = root / "ready"
         done = root / "done"
-        startup = "printf ready > {}; exec /bin/sh".format(shlex.quote(str(ready)))
+        startup = 'printf %s "$ZELLIJ_SESSION_NAME" > {}; {} {}; printf ready > {}; exec /bin/sh'.format(
+            shlex.quote(str(session_file)), shlex.quote(str(shim.parent / "vdown")),
+            shlex.quote(str(source)), shlex.quote(str(ready)))
+        shell = root / "test-shell"
+        shell.write_text("#!/bin/sh\n" + startup + "\n")
+        shell.chmod(0o700)
+        with (root / "config/config.kdl").open("a") as config:
+            config.write("default_shell " + json.dumps(str(shell)) + "\n")
         try:
-            subprocess.run([str(shim), "--layout-string", "layout { pane; }", "attach", "-b", session,
-                            "--", "/bin/sh", "-c", startup], env=a, check=True, timeout=15)
-            wait_for(ready.exists, "initial pane")
+            initial_client, initial_fd, initial_output = start_client(shim, ["--layout-string", "layout { pane; }"], a)
+            clients.append((initial_client, initial_fd))
+            try:
+                wait_for(ready.exists, "initial pane and first download")
+            except AssertionError:
+                print("initial child status:", initial_client.poll())
+                print("initial client output (tail):", repr(bytes(initial_output)))
+                print("session name:", session_file.read_text() if session_file.exists() else "not created", "requests:", requests)
+                raise
+            session = session_file.read_text()
+            assert session and not session.startswith("vssh-"), session
+            assert len(requests) == 1 and requests[0][:3] == ("A", "/download", "Bearer fake-A"), requests
+            requests.clear()
             bindings = list((root / ".local/state/vssh/zellij").glob("*.json"))
             assert len(bindings) == 1
             assert json.loads(bindings[0].read_text())["token"] == "fake-A"
-            # Attach from B while the original pane retains A's environment.
-            client, master = pty.fork()
-            if client == 0:
-                os.execve(str(shim), [str(shim), "attach", session], b)
-            import fcntl
-            import termios
-            fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 100, 0, 0))
-            terminal_output = bytearray()
-            def drain():
-                try:
-                    while True:
-                        data = os.read(master, 65536)
-                        if not data:
-                            break
-                        terminal_output.extend(data)
-                        del terminal_output[:-4000]
-                except OSError:
-                    pass
-            threading.Thread(target=drain, daemon=True).start()
+            # Disconnect A, retaining its pane, then attach from B.
+            stop_client(initial_client, initial_fd)
+            clients.clear()
+            client, master, terminal_output = start_client(shim, ["attach", session], b)
+            clients.append((client, master))
             wait_for(lambda: json.loads(bindings[0].read_text())["token"] == "fake-B", "reattach binding")
             try:
                 wait_for(lambda: len(subprocess.run([real, "-s", session, "action", "list-clients"], env=b, capture_output=True, text=True, timeout=5).stdout.splitlines()) > 1, "attached client")
@@ -125,19 +164,15 @@ def main():
             assert requests[0][1:] == ("/download", "Bearer fake-B", b"remote-file-content"), requests
             payload = json.loads(requests[1][3])
             assert payload["host"] == "host-B", payload
-            print("PASS: old Zellij pane routes both vdown and code to the reattaching vssh connection B")
+            print("PASS: native random name preserved; old pane routes vdown and code to reattaching connection B")
         finally:
-            subprocess.run([real, "kill-session", session], env=env, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL, timeout=10)
-            if client:
-                # This is our isolated client process group, never another user's Zellij.
-                try:
-                    os.killpg(client, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                os.waitpid(client, 0)
-            if master is not None:
-                os.close(master)
+            if session is None and session_file.exists():
+                session = session_file.read_text()
+            if session:
+                subprocess.run([real, "kill-session", session], env=env, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=10)
+            for pid, fd in clients:
+                stop_client(pid, fd)
             for server in servers:
                 server.shutdown()
                 server.server_close()

@@ -70,8 +70,44 @@ class BindingTests(unittest.TestCase):
         os.environ["ZELLIJ_SOCKET_DIR"] = "/another/server"
         self.assertEqual(bridge.connection(), A)
 
+    def test_native_random_name_is_discovered_in_the_pane(self):
+        os.environ["ZELLIJ_SESSION_NAME"] = "native-random-name"
+        os.environ["VSSH_ZELLIJ_AUTO_BIND"] = "1"
+        self.assertEqual(bridge.connection(), A)
+        _, filename = bridge._binding_path("native-random-name")
+        self.assertEqual(json.loads(Path(filename).read_text()), A)
+        bridge.bind_session("native-random-name", B)
+        self.assertEqual(bridge.connection(), B)
+
+    def test_first_invocation_never_overwrites_a_concurrent_attach(self):
+        bridge.bind_session("work", B)
+        bridge.bind_session("work", A, if_absent=True)
+        self.assertEqual(bridge.connection(), B)
+
+    def test_without_wrapper_unbound_panes_do_not_create_associations(self):
+        self.assertEqual(bridge.connection(), A)
+        directory, _ = bridge._binding_path("work")
+        self.assertFalse(Path(directory).exists())
+
+    def test_program_lookup_skips_other_zellij_shims(self):
+        root = Path(self.directory.name)
+        for name, contents in [("wrapper", "#!/bin/sh\n# vssh-zellij-shim\n"), ("real", "#!/bin/sh\nexit 0\n")]:
+            directory = root / name
+            directory.mkdir()
+            program = directory / "zellij"
+            program.write_text(contents)
+            program.chmod(0o700)
+        os.environ["PATH"] = os.pathsep.join([str(root / "wrapper"), str(root / "real")])
+        with patch.object(sys, "argv", [str(root / "self/zellij")]):
+            self.assertEqual(bridge.find_real_program("zellij"), str(root / "real/zellij"))
+
 
 class InvocationTests(unittest.TestCase):
+    def setUp(self):
+        environment = patch.dict(os.environ, {})
+        environment.start()
+        self.addCleanup(environment.stop)
+
     def target(self, args, sessions=("work",)):
         with patch.object(zellij, "session_list", return_value=list(sessions)):
             return zellij.attach_target("/real/zellij", args)
@@ -84,12 +120,18 @@ class InvocationTests(unittest.TestCase):
         self.assertEqual(self.target(["attach", "--index", "1"], ["one", "two"])[0], "two")
         self.assertIsNone(self.target(["attach", "--index", "-1"])[0])
 
-    def test_new_sessions_have_known_names_and_preserve_initial_command(self):
-        target, args = self.target([], [])
-        self.assertTrue(target.startswith("vssh-"))
-        self.assertEqual(args, ["--session", target])
-        target, args = self.target(["attach", "-c", "--", "echo", "hello"], [])
-        self.assertEqual(args, ["attach", "-c", target, "--", "echo", "hello"])
+    def test_native_session_names_and_initial_commands_are_preserved(self):
+        for args in [[], ["--config", "custom"], ["attach", "-c"], ["attach", "-b", "--", "echo", "hello"]]:
+            self.assertEqual(self.target(args, []), (None, args))
+
+    def test_unnamed_launch_enables_discovery_without_rewriting_arguments(self):
+        args = ["attach", "-c", "--", "echo", "hello"]
+        with patch.object(zellij, "find_real_program", return_value="/real/zellij"), patch.object(zellij, "connection", return_value=B), patch.object(zellij, "session_list", return_value=[]), patch.object(zellij, "bind_session") as bind, patch.object(zellij.os, "execv") as execute:
+            with patch.object(sys, "argv", ["zellij"] + args):
+                zellij.main()
+        bind.assert_not_called()
+        execute.assert_called_once_with("/real/zellij", ["/real/zellij"] + args)
+        self.assertEqual(os.environ["VSSH_ZELLIJ_AUTO_BIND"], "1")
 
     def test_cli_actions_help_and_remote_clients_do_not_bind(self):
         for args in [["action", "new-pane"], ["setup", "--generate-auto-start", "zsh"], ["--help"], ["attach", "--help"], ["attach", "https://example.com/work"], ["--session", "work", "action", "list-panes"]]:
